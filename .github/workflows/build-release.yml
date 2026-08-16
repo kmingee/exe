@@ -10,6 +10,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional version tag to publish, for example v0.2
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -77,7 +82,10 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -92,10 +100,34 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          MANUAL_TAG: ${{ inputs.release_tag }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "${MANUAL_TAG:-}" ]]; then
+            tag="$MANUAL_TAG"
+          else
+            tag="$(printf '%s\n' "$COMMIT_MESSAGE" | head -n 1 | sed -E 's/^release:[[:space:]]*//')"
+          fi
+
+          if [[ "$tag" != v* ]]; then
+            echo "Release tag must start with v: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Create or update release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -105,11 +137,11 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes \
-              --verify-tag
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
           fi
